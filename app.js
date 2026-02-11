@@ -538,3 +538,8 @@ function interpolateWaveform(waveform) {
     }
   }
 }
+
+// Backwards-compatible alias used by the toggle handler
+async function getPreferredCameraStream() {
+  return await getFrontCameraStream();
+}
