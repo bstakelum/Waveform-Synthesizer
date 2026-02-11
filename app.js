@@ -99,10 +99,44 @@ function resetROI() {
 }
 
 // Camera Setup (start/stop toggle)
+// Prefer front-facing camera helper
+async function getFrontCameraStream() {
+  // 1) Try strict facingMode exact
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video: { facingMode: { exact: 'user' } }, audio: false });
+  } catch (e) {}
+
+  // 2) Try preferred facingMode (more compatible)
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'user' } }, audio: false });
+  } catch (e) {}
+
+  // 3) Request any camera to obtain device labels (if not already permitted), then pick a device whose label suggests front camera
+  let tempStream = null;
+  try {
+    tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  } catch (e) {
+    // fallthrough
+  }
+
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const front = devices.find(d => d.kind === 'videoinput' && /front|user|face/i.test(d.label));
+    if (front) {
+      if (tempStream) { tempStream.getTracks().forEach(t => t.stop()); tempStream = null; }
+      return await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: front.deviceId } }, audio: false });
+    }
+  } catch (e) {}
+
+  // 4) Last resort: return the temp stream or any available camera
+  if (tempStream) return tempStream;
+  return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+}
+
 startButton.addEventListener("click", async () => {
   if (!currentStream) {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      const stream = await getFrontCameraStream();
       currentStream = stream;
       video.srcObject = stream;
       // Start overlay and show controls
@@ -461,7 +495,6 @@ function drawWaveform(waveform) {
 
 
 function interpolateWaveform(waveform) {
-  // Improved interpolation:
   // - only fill gaps up to `maxGap` columns wide
   // - only interpolate when the vertical difference between endpoints is small (maxDelta)
   const maxGap = 30; // horizontal gap (columns)
