@@ -217,6 +217,7 @@ function stopOverlayLoop() {
 
 // OpenCV integration
 let hasOpenCV = false;
+let useOpenCVExtraction = false;
 
 function setOpenCVStatus(text) {
   const el = document.getElementById('opencvStatus');
@@ -295,98 +296,8 @@ if (cameraToggleBtn) {
   });
 }
 
-function savitzkyGolaySmooth(waveform) {
-  // simple SG window=5, order=2 coefficients: [-3,12,17,12,-3]/35
-  const n = waveform.length;
-  const out = waveform.slice();
-  for (let i = 2; i < n - 2; i++) {
-    const a = waveform[i - 2], b = waveform[i - 1], c = waveform[i], d = waveform[i + 1], e = waveform[i + 2];
-    if ([a, b, c, d, e].some(v => isNaN(v))) continue;
-    out[i] = (-3 * a + 12 * b + 17 * c + 12 * d - 3 * e) / 35;
-  }
-  return out;
-}
-
 function extractWaveformOpenCV(imageData) {
-  try {
-    const width = imageData.width;
-    const height = imageData.height;
-
-    const src = cv.matFromImageData(imageData);
-    let gray = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-    // CLAHE to improve local contrast
-    let claheDst = new cv.Mat();
-    try {
-      const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-      clahe.apply(gray, claheDst);
-      clahe.delete();
-    } catch (e) {
-      // fallback if CLAHE not supported
-      gray.copyTo(claheDst);
-    }
-
-    // Adaptive threshold (black trace on white background -> invert so trace is white)
-    let thresh = new cv.Mat();
-    cv.adaptiveThreshold(claheDst, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 7);
-
-    // Morphology to remove small specks
-    let kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    let morph = new cv.Mat();
-    cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
-
-    // Find contours and choose the largest external contour (likely the trace)
-    let contours = new cv.MatVector();
-    let hierarchy = new cv.Mat();
-    cv.findContours(morph, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
-
-    let mask = new cv.Mat.zeros(morph.rows, morph.cols, cv.CV_8UC1);
-    let largestArea = 0;
-    let largestIdx = -1;
-    for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i);
-      const area = cv.contourArea(cnt);
-      if (area > largestArea) {
-        largestArea = area;
-        largestIdx = i;
-      }
-    }
-    if (largestIdx >= 0) {
-      const color = new cv.Scalar(255);
-      cv.drawContours(mask, contours, largestIdx, color, -1);
-    }
-
-    // Build waveform by column: compute centroid (mean y) of mask pixels per column
-    const waveform = new Float32Array(width);
-    for (let x = 0; x < width; x++) {
-      let sumY = 0;
-      let count = 0;
-      for (let y = 0; y < height; y++) {
-        if (mask.ucharPtr(y, x)[0] > 0) {
-          sumY += y;
-          count++;
-        }
-      }
-      if (count > 0) {
-        const meanY = sumY / count;
-        waveform[x] = 1 - (meanY / height) * 2;
-      } else {
-        waveform[x] = NaN;
-      }
-    }
-
-    // optional smoothing (preserves edges better than naive averaging)
-    const smoothed = savitzkyGolaySmooth(waveform);
-
-    // Cleanup
-    src.delete(); gray.delete(); claheDst.delete(); thresh.delete(); kernel.delete(); morph.delete(); contours.delete(); hierarchy.delete(); mask.delete();
-
-    return smoothed;
-  } catch (err) {
-    console.error('OpenCV extraction failed:', err);
-    return null;
-  }
+  return null;
 }
 
 // --- end OpenCV enhancements ---
@@ -403,14 +314,8 @@ function processImage() {
     const g = data[i + 1];
     const b = data[i + 2];
 
-    // Standard grayscale conversion
+    // Grayscale conversion
     let gray = 0.299 * r + 0.587 * g + 0.114 * b;
-
-    // Apply contrast enhancement (S-curve adjustment)
-    // This darkens darks and brightens brights
-    gray = gray / 255;
-    gray = gray < 0.5 ? 2 * gray * gray : 1 - 2 * (1 - gray) * (1 - gray);
-    gray = gray * 255;
 
     data[i] = data[i + 1] = data[i + 2] = gray;
   }
@@ -423,8 +328,8 @@ function processImage() {
 
 // Waveform Extraction
 function extractWaveform(imageData) {
-  // If OpenCV is available and initialized, use the enhanced pipeline
-  if (hasOpenCV) {
+  // Optional OpenCV path (disabled by default)
+  if (useOpenCVExtraction && hasOpenCV) {
     const wf = extractWaveformOpenCV(imageData);
     if (wf) {
       // still run lightweight interpolation to fill small NaN gaps
@@ -432,14 +337,14 @@ function extractWaveform(imageData) {
       drawWaveform(wf);
       return;
     }
-    // fall through to JS pipeline on failure
+    // fall through to loop pipeline on failure
   }
-  // Fallback to the simple per-column darkest-pixel method
-  extractWaveformFallback(imageData);
+  // Main extraction loop
+  extractWaveformLoop(imageData);
 }
 
-// Fallback extraction (original simple method)
-function extractWaveformFallback(imageData) {
+// Main extraction loop (simple per-column darkest-pixel method)
+function extractWaveformLoop(imageData) {
   const { width, height, data } = imageData;
   const waveform = new Float32Array(width);
 
@@ -508,30 +413,31 @@ function drawWaveform(waveform) {
   }
 }
 
-
 function interpolateWaveform(waveform) {
   // - only fill gaps up to `maxGap` columns wide
   // - only interpolate when the vertical difference between endpoints is small (maxDelta)
-  const maxGap = 30; // horizontal gap (columns)
-  const maxDelta = 0.2; // maximum allowed endpoint difference in waveform units (-1..1)
-  let lastValidIndex = null;
-
-  for (let i = 0; i < waveform.length; i++) {
-    const val = waveform[i];
-    if (!isNaN(val)) {
-      if (lastValidIndex !== null && lastValidIndex + 1 !== i) {
-        const gap = i - lastValidIndex;
-        if (gap <= maxGap) {
-          const startValue = waveform[lastValidIndex];
-          const endValue = waveform[i];
-          if (!isNaN(startValue) && !isNaN(endValue) && Math.abs(endValue - startValue) <= maxDelta) {
-            for (let j = 1; j < gap; j++) {
-              waveform[lastValidIndex + j] = startValue + (endValue - startValue) * (j / gap);
-            }
-          }
+  const maxGap = 20; // horizontal gap (columns)
+  const maxDelta = 0.05; // maximum allowed endpoint difference in waveform units (-1..1)
+  let i = 0;
+  while (i < waveform.length) {
+    if (!isNaN(waveform[i])) {
+      i++;
+      continue;
+    }
+    const start = i - 1;
+    while (i < waveform.length && isNaN(waveform[i])) {
+      i++;
+    }
+    const end = i;
+    const gap = end - start - 1;
+    if (start >= 0 && end < waveform.length && gap <= maxGap) {
+      const startValue = waveform[start];
+      const endValue = waveform[end];
+      if (Math.abs(endValue - startValue) <= maxDelta) {
+        for (let j = 1; j <= gap; j++) {
+          waveform[start + j] = startValue + (endValue - startValue) * (j / (gap + 1));
         }
       }
-      lastValidIndex = i;
     }
   }
 }
