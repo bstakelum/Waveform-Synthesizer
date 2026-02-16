@@ -320,9 +320,6 @@ function processImage() {
     data[i] = data[i + 1] = data[i + 2] = gray;
   }
 
-  // Put the processed grayscale back into the ROI so user can inspect it briefly
-  pctx.putImageData(imageData, roi.x, roi.y);
-
   extractWaveform(imageData);
 }
 
@@ -346,27 +343,37 @@ function extractWaveform(imageData) {
 // Main extraction loop (simple per-column darkest-pixel method)
 function extractWaveformLoop(imageData) {
   const { width, height, data } = imageData;
+  // One normalized amplitude value per x-column.
   const waveform = new Float32Array(width);
 
   const threshold = 120; // pick a value between 0 (black) and 255 (white)
+  const maxYDelta = 50; // max allowed vertical jump (pixels) from previous column when valid
+  let lastValidYPos = null;
 
+  // Scan each column independently to choose one y position.
   for (let x = 0; x < width; x++) {
     let minBrightness = 255;
-    let yPos = -1; // -1 means "no dark pixel found"
+    let yPos = -1; // -1 means "no valid pixel found"
 
+    // Search top->bottom for the darkest candidate that also stays near the last valid y.
     for (let y = 0; y < height; y++) {
       const index = (y * width + x) * 4;
       const brightness = data[index];
+      const withinContinuity = lastValidYPos === null || Math.abs(lastValidYPos - y) <= maxYDelta;
 
-      if (brightness < minBrightness) {
+      // Update best candidate only if it is darker and passes continuity.
+      if (brightness < minBrightness && withinContinuity) {
         minBrightness = brightness;
         yPos = y;
       }
     }
 
-    // Only include this column if the darkest pixel is below threshold
-    if (minBrightness < threshold) {
+    // Accept this column only when darkest valid candidate is dark enough.
+    if (minBrightness < threshold && yPos > 0) {
+      // Convert pixel y (0..height) to normalized amplitude (+1..-1).
       waveform[x] = 1 - (yPos / height) * 2;
+      // Track continuity anchor for the next column.
+      lastValidYPos = yPos;
     } else {
       waveform[x] = NaN; // set column as NaN to be skipped
     }
@@ -380,7 +387,7 @@ function extractWaveformLoop(imageData) {
 function drawWaveform(waveform) {
   wctx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
 
-  wctx.strokeStyle = "#00ffcc";
+  wctx.strokeStyle = "#ffffff";
   wctx.lineWidth = 2;
 
   let isDrawing = false;
@@ -415,28 +422,34 @@ function drawWaveform(waveform) {
 
 function interpolateWaveform(waveform) {
   // - only fill gaps up to `maxGap` columns wide
-  // - only interpolate when the vertical difference between endpoints is small (maxDelta)
   const maxGap = 20; // horizontal gap (columns)
-  const maxDelta = 0.05; // maximum allowed endpoint difference in waveform units (-1..1)
   let i = 0;
   while (i < waveform.length) {
+    // Skip columns that already have a valid waveform point.
     if (!isNaN(waveform[i])) {
       i++;
       continue;
     }
+
+    // We found a NaN run. `start` is the last valid index before the gap.
     const start = i - 1;
+
+    // Move `i` to the first valid index after this NaN run.
     while (i < waveform.length && isNaN(waveform[i])) {
       i++;
     }
+
+    // `end` is first valid index after gap; `gap` is number of NaN slots between start/end.
     const end = i;
     const gap = end - start - 1;
+
+    // Interpolate only when both endpoints exist and the gap is small enough.
     if (start >= 0 && end < waveform.length && gap <= maxGap) {
       const startValue = waveform[start];
       const endValue = waveform[end];
-      if (Math.abs(endValue - startValue) <= maxDelta) {
-        for (let j = 1; j <= gap; j++) {
-          waveform[start + j] = startValue + (endValue - startValue) * (j / (gap + 1));
-        }
+      for (let j = 1; j <= gap; j++) {
+        // j/(gap+1) gives evenly spaced positions between the two endpoints.
+        waveform[start + j] = startValue + (endValue - startValue) * (j / (gap + 1));
       }
     }
   }
