@@ -15,7 +15,7 @@
 
     <!-- Camera Panel -->
     <div class="panel">
-      <h2>Camera Input <small><span id="opencvStatus">OpenCV: loading…</span></small></h2>
+      <h2>Camera Input <small></small></h2>
       <div class="video-wrapper">
         <video id="video" autoplay playsinline></video>
         <canvas id="processingCanvas"></canvas>
@@ -46,7 +46,7 @@
 
     <!-- Waveform Panel -->
     <div class="panel">
-      <h2>Synthesized Waveform <small><span id="audioStatus">Audio: idle</span></small></h2>
+      <h2>Synthesized Waveform <small></small></h2>
       <canvas id="waveformCanvas"></canvas>
       <!-- Web Audio transport + pitch controls -->
       <div class="controls audio-controls">
@@ -59,7 +59,7 @@
       <!-- Extraction quality metrics from current capture -->
       <div id="debugPanel" class="debug-panel">
         <h3>OpenCV Debug</h3>
-        <div id="debugCompare">Capture a frame to inspect OpenCV preprocessing extraction metrics.</div>
+        <div id="debugCompare">Capture a frame for synthesis metrics.</div>
       </div>
       <!-- Pixel-level view of the exact preprocessed ROI used by extraction -->
       <div id="processedPreviewPanel" class="debug-panel">
@@ -74,6 +74,6 @@
 
   <!-- OpenCV is optional: app.js auto-falls back if the runtime is unavailable -->
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

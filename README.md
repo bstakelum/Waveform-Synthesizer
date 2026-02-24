@@ -5,7 +5,29 @@ Browser-based waveform synthesizer. Developed in partial fulfilment of the requi
 
 - `index.html`: Declares the UI structure (camera panel, ROI controls, waveform panel).
 - `style.css`: Provides layout, overlay behavior, and styling.
-- `app.js`: Handles camera stream control, ROI selection, waveform extraction, and canvas rendering.
+- `app.js`: App-level manager/orchestrator for camera capture, ROI, extraction pipeline, and waveform drawing.
+- `cameraController.js`: Camera module for start/stop, facing toggle, ROI controls/overlay, and clean ROI frame capture.
+- `audioEngine.js`: Web Audio module for waveform-to-`PeriodicWave` conversion, synth play/stop, and frequency control.
+- `imageProcessing.js`: OpenCV module for runtime readiness checks, ROI preprocessing, and processed-frame preview rendering.
+- `waveformExtractor.js`: Contains waveform extraction logic (trace finding + waveform post-processing) and exports `extractWaveformFromImageData`.
+
+## Code Documentation
+
+- Newly modularized files now include inline comments for responsibilities and processing stages:
+	- `cameraController.js`: camera lifecycle, ROI interaction, and overlay/capture flow
+	- `imageProcessing.js`: OpenCV readiness and preprocessing pipeline
+	- `waveformExtractor.js`: extraction strategies and waveform post-processing
+	- `audioEngine.js`: waveform-to-audio conversion and synth transport handling
+
+## Tuning Guide
+
+- Extraction tuning is centralized in `waveformExtractor.js` (see `TUNING GUIDE (extraction)` at the top).
+	- Start with: `DEFAULT_FOREGROUND_CUTOFF`, `CENTER_OF_MASS_CONFIG.maxJumpPx`, `TRIM_CONFIDENCE_CONFIG` thresholds.
+	- If fallback behavior is unstable, tune: `BEST_PATH_CONFIG.jumpPenalty` and `FALLBACK_GREEDY_CONFIG.maxYDelta`.
+
+- Image preprocessing tuning is centralized in `imageProcessing.js` (see `TUNING GUIDE (image preprocessing)` at the top).
+	- Start with: `denoiseKernelSize`, `backgroundKernelSize`, `claheClipLimit`, `morphologyKernelSize`.
+	- Adaptive threshold tuning remains via module options: `cvAdaptiveBlockSize` and `cvAdaptiveC`.
 
 ## Current Process Flow
 
@@ -20,8 +42,9 @@ Browser-based waveform synthesizer. Developed in partial fulfilment of the requi
 	- binary cleanup (`MORPH_OPEN` then `MORPH_CLOSE`, 3x3)
 4. The processed ROI is shown in the OpenCV processed-frame preview panel.
 5. Extraction scans one y-position per x-column with continuity constraints.
-	- Active extractor uses brightest-pixel selection per column with continuity constraints.
-	- `cvThresholdCutoff` is used as the foreground acceptance threshold.
+	- Primary extractor uses a center-of-mass tracker with confidence trimming.
+	- Dynamic-path and greedy continuity fallbacks are used when needed.
+	- `waveformForegroundCutoff` is used as the foreground acceptance threshold.
 6. Extracted waveform is analyzed for debug metrics, then post-processed:
 	- interpolation across small gaps
 	- zero-fill for unresolved points + DC centering

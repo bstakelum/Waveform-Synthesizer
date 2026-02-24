@@ -122,13 +122,6 @@ button {
   color: #ddd;
 }
 
-#debugCompare {
-  color: #cfcfcf;
-  font-size: 0.9rem;
-  line-height: 1.45;
-  white-space: pre-line;
-}
-
 /* Stack panels vertically on smaller screens */
 @media (max-width: 800px) {
   .container {
