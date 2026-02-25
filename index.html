@@ -48,22 +48,18 @@
     <div class="panel">
       <h2>Synthesized Waveform <small></small></h2>
       <canvas id="waveformCanvas"></canvas>
-      <!-- Web Audio transport + pitch controls -->
+      <!-- Web Audio transport -->
       <div class="controls audio-controls">
         <button id="playSynth">Play</button>
-        <label>Frequency
-          <input id="synthFreq" type="range" min="40" max="1000" value="220" />
-          <span id="synthFreqVal">220 Hz</span>
-        </label>
       </div>
       <!-- Extraction quality metrics from current capture -->
       <div id="debugPanel" class="debug-panel">
-        <h3>OpenCV Debug</h3>
+        <h3>Extraction Debug</h3>
         <div id="debugCompare">Capture a frame for synthesis metrics.</div>
       </div>
-      <!-- Pixel-level view of the exact preprocessed ROI used by extraction -->
+      <!-- Pixel-level view of the ROI used by extraction -->
       <div id="processedPreviewPanel" class="debug-panel">
-        <h3>OpenCV Processed Frame</h3>
+        <h3>Processed Frame</h3>
         <canvas id="processedPreviewCanvas"></canvas>
       </div>
     </div>
@@ -72,8 +68,6 @@
 
   <!-- processingCanvas moved into camera panel as overlay -->
 
-  <!-- OpenCV is optional: app.js auto-falls back if the runtime is unavailable -->
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

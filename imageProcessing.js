@@ -1,99 +1,33 @@
-// Image-processing module:
-// - waits for OpenCV runtime readiness
-// - preprocesses captured ROI frames for robust trace extraction
-// - renders optional processed-frame preview canvas
-
-// TUNING GUIDE (image preprocessing)
-// 1) Sensor noise cleanup
-//    - Increase `denoiseKernelSize` if image grain causes false trace pixels.
-//    - Keep it small to preserve thin line detail.
-// 2) Uneven lighting compensation
-//    - Increase `backgroundKernelSize` when shadows/gradients dominate the ROI.
-//    - Adjust `flattenBias` if flattened image appears too dark/bright overall.
-// 3) Local contrast strength
-//    - Raise `claheClipLimit` to make faint traces pop more.
-//    - Lower it if micro-noise becomes too prominent.
-// 4) Binary mask cleanup
-//    - Increase `morphologyKernelSize` for stronger speckle removal and gap closing.
-//    - Decrease it if thin traces get eroded/broken.
-// 5) Adaptive threshold behavior
-//    - `cvAdaptiveBlockSize` and `cvAdaptiveC` are passed from module creation options.
-//    - Larger block sizes follow broader illumination trends; `cvAdaptiveC` shifts sensitivity.
-//
-// Tunable preprocessing parameters (centralized for easier tuning).
-// - Increase denoise/background blur sizes for noisier cameras.
-// - Raise/lower flattenBias to shift midtone baseline before thresholding.
-// - Adjust CLAHE values for local contrast aggressiveness.
-// - Morph kernel controls speckle cleanup vs thin-trace preservation.
-const PREPROCESSING_CONFIG = {
-  denoiseKernelSize: 3,
-  backgroundKernelSize: 31,
-  flattenBias: 128,
-  claheClipLimit: 2.5,
-  claheTileSize: 8,
-  morphologyKernelSize: 3,
-};
+// Image-processing module (scaled back):
+// - keeps the same API used by app pipeline
+// - leaves captured ROI unchanged for downstream extraction
+// - optionally renders preview of the unprocessed ROI
 
 export function createImageProcessor({
   statusEl,
   previewCanvas,
-  useCVthreshold = true,
-  cvAdaptiveBlockSize = 31,
-  cvAdaptiveC = 13,
 } = {}) {
-  let hasOpenCV = false;
   const previewCtx = previewCanvas ? previewCanvas.getContext('2d') : null;
 
-  // Update optional OpenCV status text in the UI.
-  function setOpenCVStatus(text) {
+  const defaultConfig = {
+    flattenKernelRadius: 5,
+    flattenBias: 118,
+    contrastLowPercentile: 2,
+    contrastHighPercentile: 98,
+    minIsolatedNeighborCount: 8,
+    erodeMinForegroundCount: 6,
+  };
+
+  const ADAPTIVE_THRESHOLD_PERCENTILE = 96;
+
+  // Update optional preprocessing status text in the UI.
+  function setProcessingStatus(text) {
     if (statusEl) statusEl.textContent = text;
   }
 
-  // Poll until OpenCV runtime is available, or timeout.
-  function waitForCV(timeout = 8000) {
-    const start = performance.now();
-    return new Promise((resolve) => {
-      (function poll() {
-        if (typeof cv !== 'undefined') {
-          if (cv && cv.getBuildInformation) {
-            resolve(true);
-            return;
-          }
-
-          cv.onRuntimeInitialized = () => resolve(true);
-          return;
-        }
-        if (performance.now() - start > timeout) {
-          resolve(false);
-          return;
-        }
-        setTimeout(poll, 200);
-      })();
-    });
-  }
-
-  // Initialize OpenCV availability and expose user-friendly status.
-  async function initOpenCV() {
-    setOpenCVStatus('OpenCV: checking…');
-
-    const scriptPresent = Array.from(document.scripts).some((scriptTag) => scriptTag.src && scriptTag.src.includes('opencv.js'));
-    if (!scriptPresent) {
-      console.warn('OpenCV.js script tag not found.');
-      setOpenCVStatus('OpenCV: not included');
-      hasOpenCV = false;
-      return;
-    }
-
-    const ok = await waitForCV(8000);
-    if (ok) {
-      hasOpenCV = true;
-      setOpenCVStatus('OpenCV: ready');
-      console.log('OpenCV.js ready');
-    } else {
-      hasOpenCV = false;
-      setOpenCVStatus('OpenCV: not available');
-      console.warn('OpenCV.js did not initialize in time.');
-    }
+  // Keep the initialization hook so app pipeline remains unchanged.
+  async function initProcessor() {
+    setProcessingStatus('Preprocessing: custom pipeline ready');
   }
 
   // Draw processed ROI to preview panel for debugging/inspection.
@@ -108,116 +42,277 @@ export function createImageProcessor({
     previewCtx.putImageData(imageData, 0, 0);
   }
 
-  // Preprocess ROI frame using grayscale -> denoise -> flatten -> contrast -> threshold/morph.
-  function preprocessImageOpenCV(imageData) {
-    if (!hasOpenCV || typeof cv === 'undefined') return null;
+  function cloneImageData(imageData) {
+    return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+  }
 
-    let src = null;
-    let gray = null;
-    let denoised = null;
-    let background = null;
-    let flattened = null;
-    let contrastEnhanced = null;
-    let thresholded = null;
-    let opened = null;
-    let closed = null;
-    let rgba = null;
-    let clahe = null;
-    let openKernel = null;
-    let closeKernel = null;
+  function getGrayPercentile(imageData, percentile) {
+    const p = Math.max(0, Math.min(100, percentile));
+    const { data } = imageData;
+    const values = new Uint8Array(data.length / 4);
 
-    try {
-      src = cv.matFromImageData(imageData);
-      gray = new cv.Mat();
-      denoised = new cv.Mat();
-      background = new cv.Mat();
-      flattened = new cv.Mat();
-      contrastEnhanced = new cv.Mat();
-      thresholded = new cv.Mat();
-      opened = new cv.Mat();
-      closed = new cv.Mat();
-      rgba = new cv.Mat();
-
-      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-      cv.GaussianBlur(
-        gray,
-        denoised,
-        new cv.Size(PREPROCESSING_CONFIG.denoiseKernelSize, PREPROCESSING_CONFIG.denoiseKernelSize),
-        0,
-        0,
-        cv.BORDER_DEFAULT
-      );
-      cv.GaussianBlur(
-        denoised,
-        background,
-        new cv.Size(PREPROCESSING_CONFIG.backgroundKernelSize, PREPROCESSING_CONFIG.backgroundKernelSize),
-        0,
-        0,
-        cv.BORDER_DEFAULT
-      );
-      cv.addWeighted(denoised, 1.0, background, -1.0, PREPROCESSING_CONFIG.flattenBias, flattened);
-
-      clahe = new cv.CLAHE(
-        PREPROCESSING_CONFIG.claheClipLimit,
-        new cv.Size(PREPROCESSING_CONFIG.claheTileSize, PREPROCESSING_CONFIG.claheTileSize)
-      );
-      clahe.apply(flattened, contrastEnhanced);
-
-      if (useCVthreshold) {
-        cv.adaptiveThreshold(
-          contrastEnhanced,
-          thresholded,
-          255,
-          cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-          cv.THRESH_BINARY_INV,
-          cvAdaptiveBlockSize,
-          cvAdaptiveC
-        );
-        openKernel = cv.getStructuringElement(
-          cv.MORPH_RECT,
-          new cv.Size(PREPROCESSING_CONFIG.morphologyKernelSize, PREPROCESSING_CONFIG.morphologyKernelSize)
-        );
-        cv.morphologyEx(thresholded, opened, cv.MORPH_OPEN, openKernel);
-        closeKernel = cv.getStructuringElement(
-          cv.MORPH_RECT,
-          new cv.Size(PREPROCESSING_CONFIG.morphologyKernelSize, PREPROCESSING_CONFIG.morphologyKernelSize)
-        );
-        cv.morphologyEx(opened, closed, cv.MORPH_CLOSE, closeKernel);
-        cv.cvtColor(closed, rgba, cv.COLOR_GRAY2RGBA);
-      } else {
-        cv.cvtColor(contrastEnhanced, rgba, cv.COLOR_GRAY2RGBA);
-      }
-
-      return new ImageData(
-        new Uint8ClampedArray(rgba.data),
-        imageData.width,
-        imageData.height
-      );
-    } catch (err) {
-      console.warn('OpenCV preprocessing failed.', err);
-      return null;
-    } finally {
-      // Always release OpenCV heap allocations to avoid memory growth.
-      if (closeKernel) closeKernel.delete();
-      if (openKernel) openKernel.delete();
-      if (clahe) clahe.delete();
-      if (rgba) rgba.delete();
-      if (closed) closed.delete();
-      if (opened) opened.delete();
-      if (thresholded) thresholded.delete();
-      if (contrastEnhanced) contrastEnhanced.delete();
-      if (flattened) flattened.delete();
-      if (background) background.delete();
-      if (denoised) denoised.delete();
-      if (gray) gray.delete();
-      if (src) src.delete();
+    let j = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      values[j++] = data[i];
     }
+
+    values.sort();
+    const index = Math.floor((p / 100) * (values.length - 1));
+    return values[index];
+  }
+
+  function rgbaToGrayscale(imageData) {
+    const output = cloneImageData(imageData);
+    const { data } = output;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+
+      const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+
+      data[i] = gray;
+      data[i + 1] = gray;
+      data[i + 2] = gray;
+      data[i + 3] = 255;
+    }
+
+    return output;
+  }
+
+  function denoiseImage(imageData) {
+    const { width, height, data } = imageData;
+    const output = cloneImageData(imageData);
+    const out = output.data;
+
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let sum = 0;
+        let count = 0;
+
+        for (let ky = -1; ky <= 1; ky++) {
+          const yy = clamp(y + ky, 0, height - 1);
+          for (let kx = -1; kx <= 1; kx++) {
+            const xx = clamp(x + kx, 0, width - 1);
+            const srcIdx = (yy * width + xx) * 4;
+            sum += data[srcIdx];
+            count++;
+          }
+        }
+
+        const dstIdx = (y * width + x) * 4;
+        const blurred = Math.round(sum / count);
+        out[dstIdx] = blurred;
+        out[dstIdx + 1] = blurred;
+        out[dstIdx + 2] = blurred;
+        out[dstIdx + 3] = 255;
+      }
+    }
+
+    return output;
+  }
+
+  function flattenIllumination(imageData) {
+    const { width, height, data } = imageData;
+    const output = cloneImageData(imageData);
+    const out = output.data;
+
+    const radius = Math.max(1, Math.floor(defaultConfig.flattenKernelRadius));
+    const bias = Number.isFinite(defaultConfig.flattenBias) ? defaultConfig.flattenBias : 128;
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let backgroundSum = 0;
+        let backgroundCount = 0;
+
+        for (let ky = -radius; ky <= radius; ky++) {
+          const yy = clamp(y + ky, 0, height - 1);
+          for (let kx = -radius; kx <= radius; kx++) {
+            const xx = clamp(x + kx, 0, width - 1);
+            const backgroundIndex = (yy * width + xx) * 4;
+            backgroundSum += data[backgroundIndex];
+            backgroundCount++;
+          }
+        }
+
+        const index = (y * width + x) * 4;
+        const sourceValue = data[index];
+        const backgroundValue = Math.round(backgroundSum / backgroundCount);
+        const darkResponse = Math.max(0, backgroundValue - sourceValue);
+        const flattened = clamp(Math.round(darkResponse + bias), 0, 255);
+
+        out[index] = flattened;
+        out[index + 1] = flattened;
+        out[index + 2] = flattened;
+        out[index + 3] = 255;
+      }
+    }
+
+    return output;
+  }
+
+  function enhanceContrast(imageData) {
+    const output = cloneImageData(imageData);
+    const { data } = output;
+
+    const minValue = getGrayPercentile(output, defaultConfig.contrastLowPercentile);
+    const maxValue = getGrayPercentile(output, defaultConfig.contrastHighPercentile);
+
+    const range = maxValue - minValue;
+    if (range < 1) return output;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const normalized = Math.round(((data[i] - minValue) / range) * 255);
+      data[i] = normalized;
+      data[i + 1] = normalized;
+      data[i + 2] = normalized;
+      data[i + 3] = 255;
+    }
+
+    return output;
+  }
+
+  function applyThreshold(imageData) {
+    const output = cloneImageData(imageData);
+
+    const { data } = output;
+    const threshold = getGrayPercentile(output, ADAPTIVE_THRESHOLD_PERCENTILE);
+
+    for (let i = 0; i < data.length; i += 4) {
+      const value = data[i];
+      const binary = value >= threshold ? 255 : 0;
+      data[i] = binary;
+      data[i + 1] = binary;
+      data[i + 2] = binary;
+      data[i + 3] = 255;
+    }
+
+    return output;
+  }
+
+  function cleanupMask(imageData) {
+    const { width, height, data } = imageData;
+    const output = cloneImageData(imageData);
+    const out = output.data;
+
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+    function erode3x3(source, target) {
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          let foregroundCount = 0;
+
+          for (let ky = -1; ky <= 1; ky++) {
+            const yy = clamp(y + ky, 0, height - 1);
+            for (let kx = -1; kx <= 1; kx++) {
+              const xx = clamp(x + kx, 0, width - 1);
+              const idx = (yy * width + xx) * 4;
+              if (source[idx] === 255) foregroundCount++;
+            }
+          }
+
+          const dstIdx = (y * width + x) * 4;
+          const value = foregroundCount >= defaultConfig.erodeMinForegroundCount ? 255 : 0;
+          target[dstIdx] = value;
+          target[dstIdx + 1] = value;
+          target[dstIdx + 2] = value;
+          target[dstIdx + 3] = 255;
+        }
+      }
+    }
+
+    function dilate3x3(source, target) {
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          let anyForeground = false;
+
+          for (let ky = -1; ky <= 1 && !anyForeground; ky++) {
+            const yy = clamp(y + ky, 0, height - 1);
+            for (let kx = -1; kx <= 1; kx++) {
+              const xx = clamp(x + kx, 0, width - 1);
+              const idx = (yy * width + xx) * 4;
+              if (source[idx] === 255) {
+                anyForeground = true;
+                break;
+              }
+            }
+          }
+
+          const dstIdx = (y * width + x) * 4;
+          const value = anyForeground ? 255 : 0;
+          target[dstIdx] = value;
+          target[dstIdx + 1] = value;
+          target[dstIdx + 2] = value;
+          target[dstIdx + 3] = 255;
+        }
+      }
+    }
+
+    function suppressIsolatedPixels(source, target, minNeighborCount) {
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const centerIdx = (y * width + x) * 4;
+          if (source[centerIdx] !== 255) {
+            target[centerIdx] = 0;
+            target[centerIdx + 1] = 0;
+            target[centerIdx + 2] = 0;
+            target[centerIdx + 3] = 255;
+            continue;
+          }
+
+          let neighborCount = 0;
+          for (let ky = -1; ky <= 1; ky++) {
+            const yy = clamp(y + ky, 0, height - 1);
+            for (let kx = -1; kx <= 1; kx++) {
+              if (kx === 0 && ky === 0) continue;
+              const xx = clamp(x + kx, 0, width - 1);
+              const idx = (yy * width + xx) * 4;
+              if (source[idx] === 255) neighborCount++;
+            }
+          }
+
+          const value = neighborCount >= minNeighborCount ? 255 : 0;
+          target[centerIdx] = value;
+          target[centerIdx + 1] = value;
+          target[centerIdx + 2] = value;
+          target[centerIdx + 3] = 255;
+        }
+      }
+    }
+
+    const stageA = new Uint8ClampedArray(data);
+    const stageB = new Uint8ClampedArray(data.length);
+    const stageC = new Uint8ClampedArray(data.length);
+
+    suppressIsolatedPixels(stageA, stageB, defaultConfig.minIsolatedNeighborCount);
+    dilate3x3(stageB, stageC);
+    erode3x3(stageC, stageA);
+
+    out.set(stageA);
+    return output;
+  }
+
+  function preprocessImage(imageData) {
+    if (!imageData) return null;
+
+    const grayscale = rgbaToGrayscale(imageData);
+    const denoised = denoiseImage(grayscale);
+    const flattened = flattenIllumination(denoised);
+    const contrastEnhanced = enhanceContrast(flattened);
+    const thresholded = applyThreshold(contrastEnhanced);
+    const cleaned = cleanupMask(thresholded);
+
+    return cleaned;
   }
 
   return {
-    initOpenCV,
-    preprocessImageOpenCV,
+    initProcessor,
+    preprocessImage,
     renderProcessedPreview,
-    setOpenCVStatus,
+    setProcessingStatus,
   };
 }

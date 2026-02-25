@@ -1,31 +1,9 @@
 // Waveform extractor module:
-// - finds a single trace path across an ROI image
-// - falls back to alternative path strategies when needed
-// - outputs a centered waveform in the range expected by audio engine
-const DEFAULT_FOREGROUND_CUTOFF = 200;
+// - primary center-of-mass tracker across columns
+// - confidence-based trim of weak prefix/suffix regions
+// - no fallback paths (best-path/greedy removed)
 
-// TUNING GUIDE (extraction)
-// 1) Sensitivity to faint trace
-//    - Raise `DEFAULT_FOREGROUND_CUTOFF` only if noise is being accepted as trace.
-//    - Lower it if faint traces are frequently missed.
-// 2) Path continuity vs agility
-//    - Increase `CENTER_OF_MASS_CONFIG.maxJumpPx` to follow sharper waveform bends.
-//    - Decrease it to reject sudden jitter/noise spikes.
-// 3) Prefix/suffix trimming strictness
-//    - Raise `TRIM_CONFIDENCE_CONFIG.highThreshold` for stricter trace acceptance.
-//    - Lower `TRIM_CONFIDENCE_CONFIG.lowThreshold` to avoid early trace termination.
-// 4) Fallback behavior
-//    - Increase `BEST_PATH_CONFIG.jumpPenalty` to favor smoother global paths.
-//    - Increase `FALLBACK_GREEDY_CONFIG.maxYDelta` if greedy fallback drops valid bends.
-// 5) Post-processing smoothness
-//    - Raise `WAVEFORM_POSTPROCESSING_CONFIG.interpolationMaxGap` to bridge larger holes.
-//    - Lower it to avoid connecting unrelated segments.
-//    - Endpoint anchoring and zero-crossing start alignment are always applied internally.
-//
-// Tunable extraction parameters (centralized for easier tuning).
-const FALLBACK_GREEDY_CONFIG = {
-  maxYDelta: 18,
-};
+const DEFAULT_FOREGROUND_CUTOFF = 200;
 
 const TRIM_CONFIDENCE_CONFIG = {
   confWindowRadius: 1,
@@ -48,24 +26,6 @@ const CENTER_OF_MASS_CONFIG = {
   medianRadius: 3,
 };
 
-const BEST_PATH_CONFIG = {
-  windowRadiusX: 2,
-  windowRadiusY: 2,
-  topK: 6,
-  minScore: 0.25,
-  minSeparation: 2,
-  minRunLength: 1,
-  maxJumpPx: 14,
-  jumpPenalty: 0.03,
-};
-
-const EXTRACTION_THRESHOLDS = {
-  minValidForCOMRatio: 0.1,
-  minValidForCOMFloor: 10,
-  minValidForBestPathRatio: 0.05,
-  minValidForBestPathFloor: 8,
-};
-
 const WAVEFORM_POSTPROCESSING_CONFIG = {
   interpolationMaxGap: 30,
 };
@@ -74,7 +34,6 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-// Local foreground density around a candidate point.
 function getForegroundDensity(imageData, x, y, radiusX, radiusY, cutoff) {
   const { width, height, data } = imageData;
   let foreground = 0;
@@ -93,113 +52,6 @@ function getForegroundDensity(imageData, x, y, radiusX, radiusY, cutoff) {
   return total > 0 ? foreground / total : 0;
 }
 
-// Collect contiguous bright runs for one image column.
-function getColumnForegroundRuns(imageData, x, cutoff, minRunLength) {
-  const { height, data, width } = imageData;
-  const runs = [];
-  let y = 0;
-
-  while (y < height) {
-    const idx = (y * width + x) * 4;
-    if (data[idx] < cutoff) {
-      y++;
-      continue;
-    }
-
-    const runStart = y;
-    while (y < height) {
-      const runIdx = (y * width + x) * 4;
-      if (data[runIdx] < cutoff) break;
-      y++;
-    }
-
-    const runEnd = y - 1;
-    const runLength = runEnd - runStart + 1;
-    if (runLength >= minRunLength) {
-      runs.push({
-        yCenter: Math.round((runStart + runEnd) * 0.5),
-        runLength,
-      });
-    }
-  }
-
-  return runs;
-}
-
-// Generate per-column candidates scored by density and run strength.
-function getColumnCandidates(imageData, x, settings) {
-  const {
-    windowRadiusX,
-    windowRadiusY,
-    topK,
-    minScore,
-    minSeparation,
-    foregroundCutoff,
-    minRunLength,
-  } = settings;
-
-  const runs = getColumnForegroundRuns(imageData, x, foregroundCutoff, minRunLength);
-  const scored = [];
-
-  for (let i = 0; i < runs.length; i++) {
-    const run = runs[i];
-    const y = run.yCenter;
-    const density = getForegroundDensity(imageData, x, y, windowRadiusX, windowRadiusY, foregroundCutoff);
-    const runStrength = Math.min(1, run.runLength / 6);
-    const score = 0.75 * density + 0.25 * runStrength;
-    scored.push({ y, score });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const candidates = [];
-  for (let i = 0; i < scored.length && candidates.length < topK; i++) {
-    const entry = scored[i];
-    if (entry.score < minScore && candidates.length > 0) break;
-
-    const tooClose = candidates.some((candidate) => Math.abs(candidate.y - entry.y) < minSeparation);
-    if (tooClose) continue;
-    candidates.push(entry);
-  }
-
-  return candidates;
-}
-
-// Final fallback: brightest-pixel tracker with continuity gating.
-function fallbackGreedyTracePath(imageData, foregroundCutoff) {
-  const { width, height, data } = imageData;
-  const pathY = new Int16Array(width);
-  let lastValidYPos = null;
-  const { maxYDelta } = FALLBACK_GREEDY_CONFIG;
-
-  for (let x = 0; x < width; x++) {
-    let yPos = -1;
-    let maxBrightness = -1;
-
-    for (let y = 0; y < height; y++) {
-      const index = (y * width + x) * 4;
-      const brightness = data[index];
-      const withinContinuity = lastValidYPos === null || Math.abs(lastValidYPos - y) <= maxYDelta;
-
-      if (brightness > maxBrightness && withinContinuity) {
-        maxBrightness = brightness;
-        yPos = y;
-      }
-    }
-
-    const columnIsValid = yPos > 0 && maxBrightness >= foregroundCutoff;
-    if (columnIsValid) {
-      pathY[x] = yPos;
-      lastValidYPos = yPos;
-    } else {
-      pathY[x] = -1;
-    }
-  }
-
-  return pathY;
-}
-
-// Count accepted path points (>= 0) in an integer path buffer.
 function countValidPathPoints(pathY) {
   let count = 0;
   for (let i = 0; i < pathY.length; i++) {
@@ -208,7 +60,6 @@ function countValidPathPoints(pathY) {
   return count;
 }
 
-// Median-of-finite helper used by the 1D median smoother.
 function getMedianOfFiniteWindow(values, start, end) {
   const finite = [];
   for (let i = start; i <= end; i++) {
@@ -220,7 +71,6 @@ function getMedianOfFiniteWindow(values, start, end) {
   return finite[Math.floor(finite.length / 2)];
 }
 
-// Median filter that ignores NaN gaps.
 function medianFilterFinite1D(values, radius) {
   if (radius <= 0) return Float32Array.from(values);
   const output = new Float32Array(values.length);
@@ -233,7 +83,6 @@ function medianFilterFinite1D(values, radius) {
   return output;
 }
 
-// 1D moving average used for confidence smoothing.
 function movingAverage1D(values, radius) {
   if (radius <= 0) return Float32Array.from(values);
   const out = new Float32Array(values.length);
@@ -251,7 +100,6 @@ function movingAverage1D(values, radius) {
   return out;
 }
 
-// Trim weak prefix/suffix regions by confidence hysteresis.
 function trimTracePathByConfidence(pathY, imageData, foregroundCutoff) {
   const { width } = imageData;
   if (!pathY || pathY.length === 0) return pathY;
@@ -356,11 +204,7 @@ function trimTracePathByConfidence(pathY, imageData, foregroundCutoff) {
 
   const trimmed = new Int16Array(pathY.length);
   for (let x = 0; x < pathY.length; x++) {
-    if (x < bestSpan.start || x > bestSpan.end) {
-      trimmed[x] = -1;
-    } else {
-      trimmed[x] = pathY[x];
-    }
+    trimmed[x] = x < bestSpan.start || x > bestSpan.end ? -1 : pathY[x];
   }
 
   if (countValidPathPoints(trimmed) < settings.minKeepValidColumns) {
@@ -370,7 +214,6 @@ function trimTracePathByConfidence(pathY, imageData, foregroundCutoff) {
   return trimmed;
 }
 
-// Primary extractor: center-of-mass tracker with continuity checks.
 function findCenterOfMassTracePath(imageData, foregroundCutoff) {
   const { width, height, data } = imageData;
   const pathY = new Float32Array(width);
@@ -447,210 +290,6 @@ function findCenterOfMassTracePath(imageData, foregroundCutoff) {
   return quantized;
 }
 
-// Secondary extractor: dynamic programming over column candidates.
-function findBestTracePath(imageData, foregroundCutoff) {
-  const { width } = imageData;
-  const settings = {
-    ...BEST_PATH_CONFIG,
-    foregroundCutoff,
-  };
-
-  const candidatesByColumn = new Array(width);
-  for (let x = 0; x < width; x++) {
-    candidatesByColumn[x] = getColumnCandidates(imageData, x, settings);
-  }
-
-  const scoreByColumn = new Array(width);
-  const backByColumn = new Array(width);
-
-  const firstCandidates = candidatesByColumn[0] || [];
-  scoreByColumn[0] = new Float32Array(firstCandidates.length);
-  backByColumn[0] = new Int16Array(firstCandidates.length);
-  for (let i = 0; i < firstCandidates.length; i++) {
-    scoreByColumn[0][i] = firstCandidates[i].score;
-    backByColumn[0][i] = -1;
-  }
-
-  for (let x = 1; x < width; x++) {
-    const current = candidatesByColumn[x] || [];
-    const previous = candidatesByColumn[x - 1] || [];
-    const prevScores = scoreByColumn[x - 1] || new Float32Array(0);
-
-    const currentScores = new Float32Array(current.length);
-    const currentBack = new Int16Array(current.length);
-
-    for (let i = 0; i < current.length; i++) {
-      const currentCandidate = current[i];
-      let bestScore = -Infinity;
-      let bestPrev = -1;
-
-      for (let j = 0; j < previous.length; j++) {
-        const prevCandidate = previous[j];
-        const dy = Math.abs(currentCandidate.y - prevCandidate.y);
-        if (dy > settings.maxJumpPx) continue;
-
-        const transitionScore = prevScores[j] - settings.jumpPenalty * dy;
-        if (transitionScore > bestScore) {
-          bestScore = transitionScore;
-          bestPrev = j;
-        }
-      }
-
-      if (bestPrev === -1) {
-        currentScores[i] = currentCandidate.score;
-        currentBack[i] = -1;
-      } else {
-        currentScores[i] = bestScore + currentCandidate.score;
-        currentBack[i] = bestPrev;
-      }
-    }
-
-    scoreByColumn[x] = currentScores;
-    backByColumn[x] = currentBack;
-  }
-
-  const pathY = new Int16Array(width);
-  for (let i = 0; i < width; i++) {
-    pathY[i] = -1;
-  }
-
-  let bestFinalColumn = width - 1;
-  let bestFinalIndex = -1;
-  let bestFinalScore = -Infinity;
-
-  for (let x = width - 1; x >= 0; x--) {
-    const scores = scoreByColumn[x] || new Float32Array(0);
-    for (let i = 0; i < scores.length; i++) {
-      if (scores[i] > bestFinalScore) {
-        bestFinalScore = scores[i];
-        bestFinalIndex = i;
-        bestFinalColumn = x;
-      }
-    }
-    if (bestFinalIndex !== -1) break;
-  }
-
-  if (bestFinalIndex === -1) {
-    return pathY;
-  }
-
-  let x = bestFinalColumn;
-  let stateIndex = bestFinalIndex;
-
-  while (x >= 0) {
-    const candidates = candidatesByColumn[x] || [];
-    if (stateIndex < 0 || stateIndex >= candidates.length) break;
-
-    pathY[x] = candidates[stateIndex].y;
-    const back = backByColumn[x] || new Int16Array(0);
-    stateIndex = back.length > stateIndex ? back[stateIndex] : -1;
-    x--;
-  }
-
-  const validCount = countValidPathPoints(pathY);
-
-  const minValidForBestPath = Math.max(
-    EXTRACTION_THRESHOLDS.minValidForBestPathFloor,
-    Math.floor(width * EXTRACTION_THRESHOLDS.minValidForBestPathRatio)
-  );
-  if (validCount < minValidForBestPath) {
-    return fallbackGreedyTracePath(imageData, foregroundCutoff);
-  }
-
-  return pathY;
-}
-
-// Replace unresolved points and remove DC offset.
-function zeroAndCenterWaveform(waveform) {
-  let sum = 0;
-  let count = 0;
-
-  for (let i = 0; i < waveform.length; i++) {
-    if (Number.isNaN(waveform[i])) {
-      waveform[i] = 0;
-    }
-    sum += waveform[i];
-    count++;
-  }
-
-  const mean = count > 0 ? sum / count : 0;
-  for (let i = 0; i < waveform.length; i++) {
-    waveform[i] = waveform[i] - mean;
-  }
-}
-
-// Remove linear endpoint bias so waveform[0] and waveform[last] are both zero.
-function anchorWaveformEndpointsToZero(waveform) {
-  if (!waveform || waveform.length < 2) return;
-
-  const lastIndex = waveform.length - 1;
-  const startValue = waveform[0];
-  const endValue = waveform[lastIndex];
-
-  for (let i = 0; i <= lastIndex; i++) {
-    const t = i / lastIndex;
-    const baseline = startValue + (endValue - startValue) * t;
-    waveform[i] = waveform[i] - baseline;
-  }
-}
-
-function rotateWaveformInPlace(waveform, startIndex) {
-  const length = waveform.length;
-  if (length < 2) return;
-  const normalizedStart = ((startIndex % length) + length) % length;
-  if (normalizedStart === 0) return;
-
-  const rotated = new Float32Array(length);
-  for (let i = 0; i < length; i++) {
-    rotated[i] = waveform[(normalizedStart + i) % length];
-  }
-
-  for (let i = 0; i < length; i++) {
-    waveform[i] = rotated[i];
-  }
-}
-
-// Rotate cycle so the boundary starts near a zero crossing (prefer rising edge).
-function alignWaveformStartToZeroCrossing(waveform) {
-  if (!waveform || waveform.length < 4) return;
-  const preferRising = true;
-
-  let bestIndex = -1;
-  let bestScore = Infinity;
-
-  for (let i = 0; i < waveform.length - 1; i++) {
-    const a = waveform[i];
-    const b = waveform[i + 1];
-    const hasCrossing = (a <= 0 && b >= 0) || (a >= 0 && b <= 0);
-    if (!hasCrossing) continue;
-
-    const isRising = a <= 0 && b >= 0;
-    if (preferRising && !isRising) continue;
-
-    const score = Math.abs(a) + Math.abs(b);
-    if (score < bestScore) {
-      bestScore = score;
-      bestIndex = Math.abs(a) <= Math.abs(b) ? i : i + 1;
-    }
-  }
-
-  // Fallback: choose sample closest to zero if no desired crossing found.
-  if (bestIndex < 0) {
-    for (let i = 0; i < waveform.length; i++) {
-      const score = Math.abs(waveform[i]);
-      if (score < bestScore) {
-        bestScore = score;
-        bestIndex = i;
-      }
-    }
-  }
-
-  if (bestIndex > 0) {
-    rotateWaveformInPlace(waveform, bestIndex);
-  }
-}
-
-// Linearly fill short NaN gaps between valid neighboring samples.
 function interpolateWaveform(waveform) {
   const { interpolationMaxGap: maxGap } = WAVEFORM_POSTPROCESSING_CONFIG;
   let i = 0;
@@ -680,7 +319,91 @@ function interpolateWaveform(waveform) {
   }
 }
 
-// Public API: convert processed ROI image data into a playback-ready waveform.
+function zeroAndCenterWaveform(waveform) {
+  let sum = 0;
+  let count = 0;
+
+  for (let i = 0; i < waveform.length; i++) {
+    if (Number.isNaN(waveform[i])) {
+      waveform[i] = 0;
+    }
+    sum += waveform[i];
+    count++;
+  }
+
+  const mean = count > 0 ? sum / count : 0;
+  for (let i = 0; i < waveform.length; i++) {
+    waveform[i] -= mean;
+  }
+}
+
+function anchorWaveformEndpointsToZero(waveform) {
+  if (!waveform || waveform.length < 2) return;
+
+  const lastIndex = waveform.length - 1;
+  const startValue = waveform[0];
+  const endValue = waveform[lastIndex];
+
+  for (let i = 0; i <= lastIndex; i++) {
+    const t = i / lastIndex;
+    const baseline = startValue + (endValue - startValue) * t;
+    waveform[i] -= baseline;
+  }
+}
+
+function rotateWaveformInPlace(waveform, startIndex) {
+  const length = waveform.length;
+  if (length < 2) return;
+  const normalizedStart = ((startIndex % length) + length) % length;
+  if (normalizedStart === 0) return;
+
+  const rotated = new Float32Array(length);
+  for (let i = 0; i < length; i++) {
+    rotated[i] = waveform[(normalizedStart + i) % length];
+  }
+
+  for (let i = 0; i < length; i++) {
+    waveform[i] = rotated[i];
+  }
+}
+
+function alignWaveformStartToZeroCrossing(waveform) {
+  if (!waveform || waveform.length < 4) return;
+
+  let bestIndex = -1;
+  let bestScore = Infinity;
+
+  for (let i = 0; i < waveform.length - 1; i++) {
+    const a = waveform[i];
+    const b = waveform[i + 1];
+    const hasCrossing = (a <= 0 && b >= 0) || (a >= 0 && b <= 0);
+    if (!hasCrossing) continue;
+
+    const isRising = a <= 0 && b >= 0;
+    if (!isRising) continue;
+
+    const score = Math.abs(a) + Math.abs(b);
+    if (score < bestScore) {
+      bestScore = score;
+      bestIndex = Math.abs(a) <= Math.abs(b) ? i : i + 1;
+    }
+  }
+
+  if (bestIndex < 0) {
+    for (let i = 0; i < waveform.length; i++) {
+      const score = Math.abs(waveform[i]);
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
+  }
+
+  if (bestIndex > 0) {
+    rotateWaveformInPlace(waveform, bestIndex);
+  }
+}
+
 export function extractWaveformFromImageData(imageData, options = {}) {
   if (!imageData || !Number.isFinite(imageData.width) || !Number.isFinite(imageData.height)) {
     return null;
@@ -693,26 +416,13 @@ export function extractWaveformFromImageData(imageData, options = {}) {
     ? options.foregroundCutoff
     : DEFAULT_FOREGROUND_CUTOFF;
 
-  const waveform = new Float32Array(width);
-
   const rawTracePath = findCenterOfMassTracePath(imageData, foregroundCutoff);
-  let tracePath = trimTracePathByConfidence(rawTracePath, imageData, foregroundCutoff);
-  const minValidForCOM = Math.max(
-    EXTRACTION_THRESHOLDS.minValidForCOMFloor,
-    Math.floor(width * EXTRACTION_THRESHOLDS.minValidForCOMRatio)
-  );
+  const tracePath = trimTracePathByConfidence(rawTracePath, imageData, foregroundCutoff);
 
-  if (countValidPathPoints(tracePath) < minValidForCOM) {
-    tracePath = findBestTracePath(imageData, foregroundCutoff);
-  }
-
+  const waveform = new Float32Array(width);
   for (let x = 0; x < width; x++) {
     const yPos = tracePath[x];
-    if (yPos >= 0) {
-      waveform[x] = 1 - (yPos / height) * 2;
-    } else {
-      waveform[x] = NaN;
-    }
+    waveform[x] = yPos >= 0 ? 1 - (yPos / height) * 2 : NaN;
   }
 
   interpolateWaveform(waveform);

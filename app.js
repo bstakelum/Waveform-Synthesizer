@@ -8,24 +8,15 @@ import { createSynthAudioEngine } from './audioEngine.js';
 const waveformCanvas = document.getElementById('waveformCanvas');
 const wctx = waveformCanvas.getContext('2d');
 
-const useCVthreshold = true;
 const waveformForegroundCutoff = 200;
-const cvAdaptiveBlockSize = 31;
-const cvAdaptiveC = 13;
 
 const synthEngine = createSynthAudioEngine({
   playButton: document.getElementById('playSynth'),
-  freqInput: document.getElementById('synthFreq'),
-  freqValueEl: document.getElementById('synthFreqVal'),
   statusEl: document.getElementById('audioStatus'),
 });
 
 const imageProcessor = createImageProcessor({
-  statusEl: document.getElementById('opencvStatus'),
   previewCanvas: document.getElementById('processedPreviewCanvas'),
-  useCVthreshold,
-  cvAdaptiveBlockSize,
-  cvAdaptiveC,
 });
 
 const cameraController = createCameraController({
@@ -55,13 +46,13 @@ const cameraController = createCameraController({
   },
 });
 
-imageProcessor.initOpenCV();
+imageProcessor.initProcessor();
 cameraController.init();
 
 function processCapturedImage(imageData) {
-  const processedImageData = imageProcessor.preprocessImageOpenCV(imageData);
+  const processedImageData = imageProcessor.preprocessImage(imageData);
   if (!processedImageData) {
-    imageProcessor.setOpenCVStatus('OpenCV: preprocessing failed');
+    imageProcessor.setProcessingStatus('Preprocessing: failed');
     return;
   }
 
